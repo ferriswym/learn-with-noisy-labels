@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+cifar100/data/
+models/
