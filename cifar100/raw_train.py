@@ -18,6 +18,8 @@ sys.path.append("/home/yuming/projects/learn-with-noisy-labels")
 from nets.resnet import ResNet34
 from torchvision import models
 from dataloader import load_data
+from dataloader import load_data_sym
+from dataloader import load_data_asym
 
 # Detect if we have a GPU available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -49,7 +51,7 @@ def train_model(model, trainloader, testloader, num_epochs=num_epochs):
 
         for i, data in enumerate(trainloader, 0):
             # get the inputs
-            inputs, labels = data
+            inputs, labels, _ = data
             inputs, labels = inputs.to(device), labels.to(device)
             
             # zero the parameter gradients
@@ -109,12 +111,17 @@ def plot(hist):
     
 if __name__ == '__main__':
     # data
-    trainloader, testloader, _ = load_data()
+#    trainloader, testloader = load_data()
+#    trainloader, testloader = load_data_asym(noise_rate=0.3)
+    noise_rate=0.1
+    trainloader, testloader = load_data_asym(noise_rate=noise_rate)
     
     # model
     model = ResNet34()
-#    model.load_state_dict(models.resnet34().state_dict(), strict=False)
+#    model.load_state_dict(models.resn, classeset34().state_dict(), strict=False)
     print(model)
+    print("noise rate: %.1f"%noise_rate)
         
     model, hist = train_model(model, trainloader, testloader, num_epochs)
     plot(hist)
+    print("noise rate: %.1f"%noise_rate)

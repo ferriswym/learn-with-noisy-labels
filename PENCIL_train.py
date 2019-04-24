@@ -1,107 +1,72 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Wed Apr 10 09:28:52 2019
+Created on Sat Apr 13 14:39:24 2019
 
 @author: yuming
 """
-import sys
-sys.path.append('/home/yuming/projects/learn-with-noisy-labels/nets')
-import copy
 
+import time
 import torch
+import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
 import numpy as np
-from PIL import Image
-from torchvision import transforms
-from squeezenet import squeezenet1_1
+import sys
+sys.path.append("/home/yuming/projects/learn-with-noisy-labels")
+from tensorboardX import SummaryWriter
+from nets.squeezenet import squeezenet1_1
+from dataloader import load_data
 
-ALPHA = 0.1
-BETA = 0.4
-LAMBDA = 10000
-EPSILON = 1e-6
-
-num_epochs = 100
+# Detect if we have a GPU available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+save_name = "models/PENCIL_0418.pth"
+log_file = 'log.txt'
+writer = SummaryWriter()
 
-def SumLog(factor, exp):
-    return torch.sum(factor * torch.log(exp + EPSILON))
-
-def total_loss(outputs_s, label_contrib, noisy_labels):
-    # competibility loss
-    Lo_loss = F.cross_entropy(label_contrib, noisy_labels)
-    
-    # classification loss
-    outputs = F.softmax(outputs_s)
-    label_distrib = F.softmax(label_contrib)
-    Lc_loss = SumLog(outputs, outputs / (label_distrib + EPSILON))
-    
-    # cross entropy loss
-    Le_loss = -SumLog(outputs, outputs)
-    
-    num_classes = label_contrib.shape[1]
-    loss = 1/num_classes * Lc_loss + ALPHA * Lo_loss + BETA/num_classes * Le_loss
-    if np.isnan(loss.cpu().detach().numpy()):
-        print(outputs, label_distrib, noisy_labels)
-        sys.exit()
-    return 1/num_classes * Lc_loss + ALPHA * Lo_loss + BETA/num_classes * Le_loss
-
-def train_model(model, trainloader, testloader, num_epochs=10, num_classes=3):
-        
-    # initialize labels distribution
-    init_fact = 10
-    label_dict = {}
-    for data in trainloader:
-        names, images, noisy_labels = data
-        for idx in range(len(names)):
-            if names[idx] not in label_dict:
-                name = names[idx]
-                noisy_label = noisy_labels[idx]
-                noisy_onehot = torch.zeros(num_classes).scatter_(0, noisy_label, 1)
-                label_dict[name] = init_fact * noisy_onehot
-                
-    # training on each epoch
+def backbond_train(model, trainloader, testloader, num_epochs):
+    since = time.time()
     model.to(device)
-    optimizer = optim.SGD(model.parameters(), lr=1e-5, momentum=0.9, weight_decay=1e-5)
-    val_acc_history = []
-    best_acc = 0.0
-    best_model_wts = copy.deepcopy(model.state_dict())
+    with open(log_file, 'w') as f:
+        f.write('')
+
+    # loss function and optimizer
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.SGD(model.parameters(), lr=1e-3, momentum=0.9, weight_decay=1e-4)
+
     for epoch in range(num_epochs):
         print('Epoch {}/{}'.format(epoch, num_epochs - 1))
+        
+        running_loss = 0.0
         model.train()
+
         for i, data in enumerate(trainloader, 0):
             # get the inputs
-            names, inputs, noisy_labels = data
-            labels_contrib = []
-            for idx in range(len(names)):
-                name = names[idx]
-                labels_contrib.append(label_dict[name])
-            labels_contrib = torch.stack(labels_contrib)
-            inputs, labels_contrib, noisy_labels = inputs.to(device), \
-                                labels_contrib.to(device), noisy_labels.to(device)
+            inputs, labels, _ = data
+            inputs, labels = inputs.to(device), labels.to(device)
             
-            labels_contrib.requires_grad = True
+            # zero the parameter gradients
             optimizer.zero_grad()
-            outputs = model(inputs)            
-            loss = total_loss(outputs, labels_contrib, noisy_labels)            
+            
+            # forward + backward + optimize
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
+            running_loss += loss.item()
             
-            if labels_contrib.grad is not None:
-                for idx in range(len(names)):
-                    name = names[idx]
-                    label_dict[name] -= LAMBDA * labels_contrib.grad[idx].cpu()
-                labels_contrib.grad.zero_()
-            else:
-                exit()
-                    
+        print('loss: %.5f' % (running_loss / (i+1)))
+        with open(log_file, 'a') as f:
+            f.write('loss: %.5f\n' % (running_loss / (i+1)))
+        
+        # evaluation
+        running_loss = 0.0
         model.eval()
         correct = 0
         total = 0
-        
         for data in testloader:
-            _, images, labels = data
+            images, labels, _ = data
             images, labels = images.to(device), labels.to(device)
             outputs = model(images)
             _, predicted = torch.max(outputs.data, 1)
@@ -109,80 +74,236 @@ def train_model(model, trainloader, testloader, num_epochs=10, num_classes=3):
             correct += torch.sum(predicted == labels)
             
         # statistics
-        eval_acc = correct.double() / total
-        val_acc_history.append(eval_acc)
-        
-        # deep copy the best model
-        if eval_acc > best_acc:
-            best_acc = eval_acc
-            best_model_wts = copy.deepcopy(model.state_dict())
-            torch.save(best_model_wts, "models/model_squeezenet_best.pth")
-                    
+        eval_acc = correct.double() / total               
         print(eval_acc)
+    
+    time_elapsed = time.time() - since
+    torch.save(model.state_dict(), "models/Backbond_0418.pth")
+    print('Backbond training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
+    
+    return model
+
+ALPHA = 0.1
+BETA = 0.4
+LAMBDA = 1000
+#EPSILON = 1e-20
+
+def SumLogSoftmax(factor, inputs):
+    return torch.sum(F.softmax(factor, 1) * F.log_softmax(inputs, 1)) / factor.shape[0]
+
+def total_loss(outputs, label_contrib, noisy_labels):
+    # competibility loss
+    Lo_loss = F.cross_entropy(label_contrib, noisy_labels)
+    
+    # classification loss
+    Lc_loss = SumLogSoftmax(outputs, outputs) - SumLogSoftmax(outputs, label_contrib)
+    
+    # cross entropy loss
+    Le_loss = -SumLogSoftmax(outputs, outputs)
+    
+    num_classes = label_contrib.shape[1]
+#    noisy_onehot = torch.zeros(label_contrib.shape).scatter_(1, noisy_labels.cpu().resize_(noisy_labels.shape[0], 1), 1)
+#    noisy_onehot = noisy_onehot.to(device)
+##    print(noisy_onehot[0], outputs[0])
+#    cls_loss = F.cross_entropy(outputs, noisy_labels)
+#    cls_loss2 = -SumLogSoftmax(noisy_onehot, outputs)
+#    print(cls_loss, cls_loss2)
+    loss = 1/num_classes * Lc_loss + ALPHA * Lo_loss + BETA/num_classes * Le_loss
+#    if np.isnan(loss.cpu().detach().numpy()):
+#        print(outputs, label_distrib, noisy_labels)
+#        sys.exit()
+#    print(1/num_classes * Lc_loss, ALPHA * Lo_loss, BETA/num_classes * Le_loss)
+    return loss
+
+def PENCIL_train(model, trainloader, testloader, num_epochs, num_classes=4):
+    since = time.time()
+    model.to(device)
+    with open(log_file, 'w') as f:
+        f.write('')
+
+    # initialize labels distribution
+    init_fact = 10
+    label_dict = {}
+    for data in trainloader:
+        images, noisy_labels, names = data
+        for idx in range(len(names)):
+            if names[idx] not in label_dict:
+                num = names[idx]
+                noisy_label = noisy_labels[idx]
+                noisy_onehot = torch.zeros(num_classes).scatter_(0, noisy_label, 1)
+                label_dict[num] = init_fact * noisy_onehot
+
+    # training on each epoch
+    optimizer = optim.SGD(model.parameters(), lr=1e-3, momentum=0.9, weight_decay=1e-4)
+    for epoch in range(num_epochs):
+        print('Epoch {}/{}'.format(epoch, num_epochs - 1))        
+        running_loss = 0.0
+        running_Lo = 0.0
+        running_Le = 0.0
+        running_Lc = 0.0
+        model.train()
+        for i, data in enumerate(trainloader, 0):
+            # get the inputs
+            inputs, noisy_labels, names = data
+            labels_contrib = []
+            for idx in range(len(names)):
+                num = names[idx]
+                labels_contrib.append(label_dict[num])
+            labels_contrib = torch.stack(labels_contrib)
+            inputs, labels_contrib, noisy_labels = inputs.to(device), \
+                                labels_contrib.to(device), noisy_labels.to(device)
             
-#        print('loss: %.5f' % (running_loss / (i+1)))
-
-class image_qa_data(torch.utils.data.Dataset):
-    def __init__(self, source, transform=None):
-        self.data = []
-        self.labels = []
-        self.transform = transform
-        with open(source) as f:
-            num = 0
-            for l in f.readlines():
-                num += 1
-                full_path, label = l.split(' ')
-                self.data.append(full_path)
-                self.labels.append(int(label))
-        self.data = np.stack(self.data)#.transpose((0, 3, 1, 2))
-        
-    def __getitem__(self, index):
-        """
-        Args:
-            index (int): Index
-
-        Returns:
-            tuple: (image, target) where target is index of the target class.
-        """
-        try:
-            name, label = self.data[index], self.labels[index]
-        except:
-            print(index, self.data.shape)
+            labels_contrib.requires_grad = True
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            Lo_loss = ALPHA * F.cross_entropy(labels_contrib, noisy_labels)
+            Le_loss = -BETA/num_classes * SumLogSoftmax(outputs, outputs)
+            Lc_loss = 1/num_classes * (SumLogSoftmax(outputs, outputs) - SumLogSoftmax(outputs, labels_contrib))
+            loss = Lo_loss + Le_loss + Lc_loss
+#            loss = total_loss(outputs, labels_contrib, noisy_labels)            
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+            running_Lo += Lo_loss.item()
+            running_Le += Le_loss.item()
+            running_Lc += Lc_loss.item()
             
-        # doing this so that it is consistent with all other datasets
-        # to return a PIL Image
-        img = Image.open(name)
+            if labels_contrib.grad is not None:
+                for idx in range(len(names)):
+                    num = names[idx]
+                    label_dict[num] -= LAMBDA * labels_contrib.grad[idx].cpu()
+                labels_contrib.grad.zero_()
+            else:
+                sys.exit()
+        print('loss: %.5f' % (running_loss / (i+1)))
+        writer.add_scalar('loss/total_loss', running_loss / (i+1), epoch)
+        writer.add_scalar('loss/Lo_loss', running_Lo / (i+1), epoch)
+        writer.add_scalar('loss/Lc_loss', running_Lc / (i+1), epoch)
+        writer.add_scalar('loss/Le_loss', running_Le / (i+1), epoch)
+        with open(log_file, 'a') as f:
+            f.write('loss: %.5f\n' % (running_loss / (i+1)))
+            
+        model.eval()
+        correct = 0
+        total = 0
         
-        if self.transform is not None:
-            img = self.transform(img)
+        for data in testloader:
+            images, labels, _ = data
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += torch.sum(predicted == labels)
+            
+        # statistics
+        eval_acc = correct.double() / total                            
+        print(eval_acc)
+    
+    with open('soft_label.txt', 'w') as f:    
+        for num in label_dict:
+            try:
+                f.write("%s: %s\n"%(str(num), str(F.softmax(label_dict[num]))))
+            except:
+                pass
+            
+    time_elapsed = time.time() - since
+    torch.save(model.state_dict(), save_name)
+    print('PENCIL training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
+    
+    return model, label_dict
 
-        return name, img, label
+def fine_tune(model, label_distrib, trainloader, testloader, num_epochs, num_classes=4):
+    since = time.time()
+    model.to(device)
+
+    # training on each epoch
+    optimizer = optim.SGD(model.parameters(), lr=1e-3, momentum=0.9, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.MultiStepLR(optimizer, [3, 6])
     
-    def __len__(self):
-        return len(self.data)
+    for epoch in range(num_epochs):
+        print('Epoch {}/{}'.format(epoch, num_epochs - 1))
+        
+        scheduler.step()
+        running_loss = 0.0
+        model.train()
+        
+        for i, data in enumerate(trainloader, 0):
+            # get the inputs
+            inputs, _, names = data
+            labels = []
+            for idx in range(len(names)):
+                num = names[idx]
+                labels.append(label_distrib[num])
+            labels = torch.stack(labels)
+            inputs, labels = inputs.to(device), labels.to(device)
+            
+            labels.requires_grad = False
+            optimizer.zero_grad()
+            outputs = model(inputs) 
+            loss = 1/num_classes * (SumLogSoftmax(outputs, outputs) - SumLogSoftmax(outputs, labels))   
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()            
+        
+        print('loss: %.5f' % (running_loss / (i+1)))
+        with open(log_file, 'a') as f:
+            f.write('loss: %.5f\n' % (running_loss / (i+1)))
+            
+        model.eval()
+        correct = 0
+        total = 0
+        
+        for data in testloader:
+            images, labels, _ = data
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += torch.sum(predicted == labels)
+            
+        # statistics
+        eval_acc = correct.double() / total                            
+        print(eval_acc) 
+        
+    time_elapsed = time.time() - since
+    print('Fine-tune complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
+    torch.save(model.state_dict(), "models/finetune_0418.pth")
+    return model
+
+# Plot the training curves of validation accuracy
+def plot(hist, num_epochs):
+    plt.title("Validation Accuracy vs. Number of Training Epochs")
+    plt.xlabel("Training Epochs")
+    plt.ylabel("Validation Accuracy")
+    plt.plot(range(1, num_epochs+1), hist)
+    plt.ylim(0, 1.)
+    plt.xticks(np.arange(0, len(hist) + 1, 50))
+    plt.show()
+
+def draw_loss(log_file):
+    loss = []
+    with open(log_file, 'r') as f:
+        for l in f.readlines():
+            if l.split(' ')[0] == 'loss:':
+                loss.append(float(l.split(' ')[1]))
+    plt.title("Loss vs. Number of Training Epochs")
+    plt.xlabel("Training Epochs")
+    plt.ylabel("Loss")
+    plt.plot(range(1, len(loss) + 1), loss)
+    plt.yticks(np.arange(min(loss), max(loss)))
+    plt.xticks(np.arange(0, len(loss) + 1, 40))
+    plt.show()
     
-if __name__ == "__main__":
-    # load model
-    model = squeezenet1_1(num_classes=3)
-    state_dict = torch.load('/home/yuming/projects/learn-with-noisy-labels/models/model_squeezenet_20190409.pth')
-    model.load_state_dict(state_dict)
-    
-    # load data
-    transform_train = transforms.Compose([
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.480, 0.457, 0.406), (1, 1, 1))])
-    transform_test = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.480, 0.457, 0.406), (1, 1, 1))])
+if __name__ == '__main__':
     train_source = '/data/yuming/image_qa/data/fuzzy_train_crop.txt'
     test_source = '/data/yuming/image_qa/data/fuzzy_test_crop.txt'
-    trainset = image_qa_data(train_source, transform_train)
-    testset = image_qa_data(test_source, transform_test)
-    trainloader = torch.utils.data.DataLoader(trainset, batch_size=64,
-                                              shuffle=True, num_workers=8)
-    testloader = torch.utils.data.DataLoader(testset, batch_size=64,
-                                             shuffle=False, num_workers=8)
-    
-    
-    train_model(model, trainloader, testloader)
+    trainloader, testloader = load_data(train_source, test_source)
+    model = squeezenet1_1(num_classes=4)
+#    print(model)
+        
+    model = backbond_train(model, trainloader, testloader, num_epochs=8)
+#    state_dict = torch.load('models/Backbond_0418.pth')
+#    model.load_state_dict(state_dict)
+    model, label_distrib = PENCIL_train(model, trainloader, testloader, num_epochs=50)
+    model = fine_tune(model, label_distrib, trainloader, testloader, num_epochs=9)
+    draw_loss(log_file)
